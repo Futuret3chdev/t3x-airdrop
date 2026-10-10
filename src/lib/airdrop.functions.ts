@@ -1,4 +1,6 @@
+import { createHmac, randomBytes } from "node:crypto";
 import { createServerFn } from "@tanstack/react-start";
+import { getCookie, setCookie, setResponseHeader } from "@tanstack/react-start/server";
 import { getSql } from "@/lib/db";
 import { authMiddleware } from "@/lib/auth/middleware";
 import { nextResetIso, weekKey, weekStartMs } from "@/lib/week";
@@ -45,7 +47,11 @@ export const getMine = createServerFn({ method: "GET" })
     const week = weekKey();
     const xId = await xAccount(context.userId);
     await sql`insert into wallets (user_id) values (${context.userId}) on conflict (user_id) do nothing`;
-    if (xId) {
+    const wallet = await sql<{ handle: string | null; xId: string | null; balance: number }>`
+      select handle, x_id as "xId", balance from wallets where user_id = ${context.userId}
+    `;
+    const known = Boolean(xId || wallet[0]?.xId);
+    if (known) {
       const grantId = `grant:${week}:${context.userId}`;
       await sql`
         insert into drops (user_id, week_key, tweet_id, coins, claimed)
@@ -53,9 +59,6 @@ export const getMine = createServerFn({ method: "GET" })
         on conflict (tweet_id) do nothing
       `;
     }
-    const wallet = await sql<{ handle: string | null; xId: string | null; balance: number }>`
-      select handle, x_id as "xId", balance from wallets where user_id = ${context.userId}
-    `;
     const drops = await sql<DropRow>`
       select tweet_id as "tweetId", coins, claimed
       from drops
@@ -66,7 +69,7 @@ export const getMine = createServerFn({ method: "GET" })
     return {
       week,
       resetAt: nextResetIso(),
-      needsX: !xId,
+      needsX: !known,
       handle: wallet[0]?.handle ?? null,
       balance: wallet[0]?.balance ?? 0,
       waiting,
@@ -74,6 +77,98 @@ export const getMine = createServerFn({ method: "GET" })
       board: await pulse(week),
     };
   });
+
+export const startProof = createServerFn({ method: "POST" })
+  .validator((handle: string) => handle.trim().replace(/^@/, ""))
+  .handler(async ({ data: handle }) => {
+    if (!/^[A-Za-z0-9_]{1,15}$/.test(handle)) return { ok: false as const, error: "That is not an X handle." };
+    const profile = await loadUser(handle);
+    if (!profile) return { ok: false as const, error: "X did not show that account." };
+    const code = `T3X-${randomBytes(4).toString("hex").toUpperCase()}`;
+    const sql = await getSql();
+    await sql`insert into x_proofs (code, handle) values (${code}, ${profile.screen})`;
+    setCookie("t3x_proof", code, { httpOnly: true, secure: true, sameSite: "lax", path: "/", maxAge: 60 * 30 });
+    const text = `Claiming this week's T3X drop ${code} #T3X #T3XDrop`;
+    return {
+      ok: true as const,
+      handle: profile.screen,
+      text,
+      intent: `https://x.com/intent/post?text=${encodeURIComponent(text)}`,
+    };
+  });
+
+export const finishProof = createServerFn({ method: "POST" })
+  .validator((url: string) => url.trim())
+  .handler(async ({ data: url }) => {
+    const code = getCookie("t3x_proof");
+    if (!code) return { ok: false as const, error: "Start again from your handle. This browser has no code." };
+    const id = url.match(/status(?:es)?\/(\d+)/)?.[1];
+    if (!id) return { ok: false as const, error: "Paste the link to the post." };
+    const sql = await getSql();
+    const proof = await sql<{ handle: string }>`select handle from x_proofs where code = ${code} limit 1`;
+    if (!proof[0]) return { ok: false as const, error: "That code has expired. Start again." };
+    const tweet = await loadTweet(id);
+    if (!tweet) return { ok: false as const, error: "X did not return that post." };
+    const profile = await loadUser(proof[0].handle);
+    if (!profile || tweet.authorId !== profile.id) return { ok: false as const, error: "That post is not from the handle you entered." };
+    if (!tweet.text.toUpperCase().includes(code)) return { ok: false as const, error: "The post does not include your code." };
+    const text = tweet.text.toLowerCase();
+    if (!TAGS.every((tag) => text.includes(tag))) {
+      return { ok: false as const, error: "The post needs both #T3X and #T3XDrop." };
+    }
+    const week = weekKey();
+    const reset = Date.parse(nextResetIso());
+    if (tweet.at < weekStartMs(week) || tweet.at >= reset) {
+      return { ok: false as const, error: "That post is outside this week." };
+    }
+    const signed = await openSession(profile.screen);
+    if (!signed.ok) return signed;
+    await sql`insert into wallets (user_id, handle, x_id) values (${signed.userId}, ${profile.screen}, ${profile.id})
+      on conflict (user_id) do update set handle = ${profile.screen}, x_id = ${profile.id}`;
+    const grantId = `grant:${week}:${signed.userId}`;
+    await sql`
+      insert into drops (user_id, week_key, tweet_id, coins, claimed)
+      values (${signed.userId}, ${week}, ${grantId}, ${GRANT}, false)
+      on conflict (tweet_id) do nothing
+    `;
+    await sql`
+      insert into drops (user_id, week_key, tweet_id, coins, claimed)
+      values (${signed.userId}, ${week}, ${id}, ${POST}, false)
+      on conflict (tweet_id) do nothing
+    `;
+    await sql`delete from x_proofs where code = ${code}`;
+    setCookie("t3x_proof", "", { httpOnly: true, secure: true, sameSite: "lax", path: "/", maxAge: 0 });
+    return { ok: true as const };
+  });
+
+async function openSession(handle: string): Promise<{ ok: true; userId: string } | { ok: false; error: string }> {
+  const { auth } = await import("@/lib/auth/server");
+  const email = `${handle.toLowerCase()}@x.t3x-airdrop.local`;
+  const secret = process.env.BETTER_AUTH_SECRET || "t3x-preview-session";
+  const password = createHmac("sha256", secret).update(`t3x:${handle.toLowerCase()}`).digest("hex");
+  const headers = new Headers();
+  const requestHeaders = (await import("@tanstack/react-start/server")).getRequestHeaders();
+  requestHeaders.forEach((value, key) => headers.set(key, value));
+  let response = await auth.api.signUpEmail({
+    body: { email, password, name: handle },
+    headers,
+    asResponse: true,
+  });
+  if (!response.ok) {
+    response = await auth.api.signInEmail({
+      body: { email, password },
+      headers,
+      asResponse: true,
+    });
+  }
+  const cookies = response.headers.getSetCookie();
+  if (cookies.length) setResponseHeader("set-cookie", cookies);
+  if (!response.ok) return { ok: false, error: "The session could not be opened. Try again." };
+  const body = (await response.json().catch(() => null)) as { user?: { id?: string } } | null;
+  const userId = body?.user?.id;
+  if (!userId) return { ok: false, error: "Signed in, but the account id was missing." };
+  return { ok: true, userId };
+}
 
 export const bindHandle = createServerFn({ method: "POST" })
   .validator((handle: string) => handle.trim().replace(/^@/, ""))

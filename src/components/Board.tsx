@@ -1,8 +1,7 @@
 import { useEffect, useState } from "react";
-import { signIn } from "@/lib/auth/client";
 import { SignedIn, UserButton } from "@/lib/auth/gates";
 import { useCurrentUserState } from "@/lib/auth/use-current-user";
-import { bindHandle, checkPost, claimCoins, getMine, getPulse } from "@/lib/airdrop.functions";
+import { bindHandle, checkPost, claimCoins, finishProof, getMine, getPulse, startProof } from "@/lib/airdrop.functions";
 
 type Row = { handle: string; coins: number };
 type Drop = { tweetId: string; coins: number; claimed: boolean };
@@ -23,6 +22,7 @@ export function Board() {
   const [handle, setHandle] = useState("");
   const [link, setLink] = useState("");
   const [note, setNote] = useState("");
+  const [proof, setProof] = useState<{ handle: string; text: string; intent: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [now, setNow] = useState(() => Date.now());
 
@@ -51,13 +51,30 @@ export function Board() {
   const left = view ? Math.max(0, Date.parse(view.resetAt) - now) : 0;
   const clock = parts(left);
 
-  async function enter() {
+  async function begin() {
     setBusy(true);
     setNote("");
     try {
-      await signIn("grok-x", { callbackURL: "/" });
-    } catch (err) {
-      setNote(err instanceof Error ? err.message : "Sign-in failed.");
+      const result = await startProof({ data: handle });
+      if (!result.ok) setNote(result.error);
+      else setProof({ handle: result.handle, text: result.text, intent: result.intent });
+    } catch {
+      setNote("Could not start sign-in.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function finish() {
+    setBusy(true);
+    setNote("");
+    try {
+      const result = await finishProof({ data: link });
+      if (!result.ok) setNote(result.error);
+      else window.location.assign("/");
+    } catch {
+      setNote("Could not finish sign-in.");
+    } finally {
       setBusy(false);
     }
   }
@@ -139,18 +156,42 @@ export function Board() {
         </ul>
         <p className="text-sm text-muted">Post with #T3X and #T3XDrop. We read the post on X. You claim the coins yourself.</p>
 
-        {!user && (
-          <button type="button" disabled={busy} onClick={enter} className="flex min-h-14 items-center justify-center gap-3 bg-fg px-5 text-lg text-bg disabled:opacity-50">
-            <XMark />
-            Sign in with X
-          </button>
-        )}
-
-        {user && mine?.needsX && (
-          <button type="button" disabled={busy} onClick={enter} className="flex min-h-14 items-center justify-center gap-3 bg-fg px-5 text-lg text-bg">
-            <XMark />
-            Sign in with X
-          </button>
+        {(!user || mine?.needsX) && (
+          <div className="grid gap-3">
+            {!proof ? (
+              <div className="flex flex-col gap-3 sm:flex-row">
+                <input
+                  value={handle}
+                  onChange={(event) => setHandle(event.target.value)}
+                  placeholder="@handle"
+                  className="min-h-12 flex-1 border border-line bg-bg px-3 text-fg outline-none"
+                />
+                <button type="button" disabled={busy} onClick={begin} className="flex min-h-12 items-center justify-center gap-3 bg-fg px-5 text-bg disabled:opacity-50">
+                  <XMark />
+                  Sign in with X
+                </button>
+              </div>
+            ) : (
+              <>
+                <p className="text-sm text-muted">Post this from @{proof.handle}, then paste the link. X will not send you back here on its own.</p>
+                <p className="border border-line bg-bg px-3 py-3 text-sm">{proof.text}</p>
+                <a href={proof.intent} target="_blank" rel="noreferrer" className="flex min-h-12 items-center justify-center bg-fg px-5 text-bg">
+                  Open X
+                </a>
+                <div className="flex flex-col gap-3 sm:flex-row">
+                  <input
+                    value={link}
+                    onChange={(event) => setLink(event.target.value)}
+                    placeholder="Link to that post"
+                    className="min-h-12 flex-1 border border-line bg-bg px-3 text-fg outline-none"
+                  />
+                  <button type="button" disabled={busy} onClick={finish} className="min-h-12 border border-line px-4 text-fg">
+                    I posted it
+                  </button>
+                </div>
+              </>
+            )}
+          </div>
         )}
 
         {user && mine && !mine.needsX && (
