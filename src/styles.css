@@ -1,15 +1,15 @@
 @import "tailwindcss";
 
 @theme {
-  --color-bg: #0c0a08;
-  --color-surface: #16130e;
-  --color-fg: #f3ead7;
-  --color-muted: #a89880;
-  --color-gold: #e8c56b;
-  --color-line: #3a3226;
+  --color-bg: #090909;
+  --color-surface: #141414;
+  --color-fg: #f4f1ea;
+  --color-muted: #9a948a;
+  --color-line: #2c2a27;
+  --color-gold: #e4c37a;
   --font-display: "Cormorant Garamond", serif;
   --font-sans: "Outfit", sans-serif;
-  --radius: 0.25rem;
+  --font-mono: ui-monospace, "SFMono-Regular", Menlo, monospace;
 }
 
 @layer base {

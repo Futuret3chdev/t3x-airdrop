@@ -1,4 +1,5 @@
 import { pendingMigrations } from "../../scripts/migration-plan.mjs";
+import { readSnapshot, snapshotsEnabled, writeSnapshot } from "./db-snapshot";
 
 /** Which database backend is active. */
 export type DbSource = "neon" | "pglite";
@@ -48,6 +49,7 @@ const globalRef = globalThis as typeof globalThis & {
   __pgSqlPromise__?: Promise<Sql>;
   __pgliteInstance__?: Promise<import("@electric-sql/pglite").PGlite>;
   __pgliteMigrateChain__?: Promise<void>;
+  __pgliteDirty__?: boolean;
 };
 
 /**
@@ -110,6 +112,7 @@ async function createPgliteSql(): Promise<Sql> {
   // One in-memory instance per process, shared across HMR module instances, so
   // data survives source edits (it resets on dev-server restart).
   globalRef.__pgliteInstance__ ??= (async () => {
+    const snap = await readSnapshot().catch(() => null);
     const { PGlite } = await import("@electric-sql/pglite");
     const pg = new PGlite({
       parsers: {
@@ -117,8 +120,26 @@ async function createPgliteSql(): Promise<Sql> {
         [OID_DATE]: identity,
         [OID_INTERVAL]: identity,
       },
+      ...(snap ? { loadDataDir: snap } : {}),
     });
     await pg.waitReady;
+    const run = pg.query.bind(pg);
+    pg.query = ((text: string, params?: unknown[], options?: object) => {
+      if (typeof text === "string" && /^\s*(insert|update|delete|create|alter|drop|truncate)/i.test(text)) {
+        globalRef.__pgliteDirty__ = true;
+      }
+      return run(text, params, options);
+    }) as typeof pg.query;
+    const exec = pg.exec.bind(pg);
+    pg.exec = (async (text: string, options?: object) => {
+      globalRef.__pgliteDirty__ = true;
+      return exec(text, options);
+    }) as typeof pg.exec;
+    const transaction = pg.transaction.bind(pg);
+    pg.transaction = (async (fn) => {
+      globalRef.__pgliteDirty__ = true;
+      return transaction(fn);
+    }) as typeof pg.transaction;
     await pg.exec(
       "create table if not exists _migrations (name text primary key, applied_at timestamptz not null default now())",
     );
@@ -192,6 +213,19 @@ export function getSql(): Promise<Sql> {
     throw err;
   });
   return sqlPromise;
+}
+
+export async function flushDbIfDirty(): Promise<void> {
+  if (!globalRef.__pgliteDirty__ || !snapshotsEnabled() || !globalRef.__pgliteInstance__) return;
+  globalRef.__pgliteDirty__ = false;
+  try {
+    const pg = await globalRef.__pgliteInstance__;
+    const dump = await pg.dumpDataDir("gzip");
+    await writeSnapshot(dump);
+  } catch (err) {
+    globalRef.__pgliteDirty__ = true;
+    console.error("[db] snapshot failed", err);
+  }
 }
 
 /**
