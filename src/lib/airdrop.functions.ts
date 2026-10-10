@@ -88,7 +88,7 @@ export const startProof = createServerFn({ method: "POST" })
     const sql = await getSql();
     await sql`insert into x_proofs (code, handle) values (${code}, ${profile.screen})`;
     setCookie("t3x_proof", code, { httpOnly: true, secure: true, sameSite: "lax", path: "/", maxAge: 60 * 30 });
-    const text = `Claiming this week's T3X drop ${code} #T3X #T3XDrop`;
+    const text = `#T3X #T3XDrop`;
     return {
       ok: true as const,
       handle: profile.screen,
@@ -101,17 +101,16 @@ export const finishProof = createServerFn({ method: "POST" })
   .validator((url: string) => url.trim())
   .handler(async ({ data: url }) => {
     const code = getCookie("t3x_proof");
-    if (!code) return { ok: false as const, error: "Start again from your handle. This browser has no code." };
+    if (!code) return { ok: false as const, error: "Enter your handle again, then paste the post." };
     const id = url.match(/status(?:es)?\/(\d+)/)?.[1];
     if (!id) return { ok: false as const, error: "Paste the link to the post." };
     const sql = await getSql();
     const proof = await sql<{ handle: string }>`select handle from x_proofs where code = ${code} limit 1`;
-    if (!proof[0]) return { ok: false as const, error: "That code has expired. Start again." };
+    if (!proof[0]) return { ok: false as const, error: "Enter your handle again, then paste the post." };
     const tweet = await loadTweet(id);
     if (!tweet) return { ok: false as const, error: "X did not return that post." };
     const profile = await loadUser(proof[0].handle);
     if (!profile || tweet.authorId !== profile.id) return { ok: false as const, error: "That post is not from the handle you entered." };
-    if (!tweet.text.toUpperCase().includes(code)) return { ok: false as const, error: "The post does not include your code." };
     const text = tweet.text.toLowerCase();
     if (!TAGS.every((tag) => text.includes(tag))) {
       return { ok: false as const, error: "The post needs both #T3X and #T3XDrop." };
@@ -265,9 +264,18 @@ async function loadTweet(id: string): Promise<{ authorId: string; text: string; 
     text?: string;
     created_timestamp?: number;
     author?: { id?: string };
+    entities?: { hashtags?: { text?: string }[] };
   } | undefined;
   if (!tweet?.author?.id || !tweet.text || !tweet.created_timestamp) return null;
-  return { authorId: String(tweet.author.id), text: tweet.text, at: tweet.created_timestamp * 1000 };
+  const tags = (tweet.entities?.hashtags ?? [])
+    .map((tag) => (tag.text ? `#${tag.text}` : ""))
+    .filter(Boolean)
+    .join(" ");
+  return {
+    authorId: String(tweet.author.id),
+    text: `${tweet.text} ${tags}`,
+    at: tweet.created_timestamp * 1000,
+  };
 }
 
 async function readJson(url: string): Promise<Record<string, unknown> | null> {

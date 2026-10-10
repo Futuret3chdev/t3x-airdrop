@@ -173,8 +173,7 @@ export function Board() {
               </div>
             ) : (
               <>
-                <p className="text-sm text-muted">Post this from @{proof.handle}, then paste the link. X will not send you back here on its own.</p>
-                <p className="border border-line bg-bg px-3 py-3 text-sm">{proof.text}</p>
+                <p className="text-sm text-muted">Paste a post from @{proof.handle} that includes both #T3X and #T3XDrop. A post you already made is fine.</p>
                 <a href={proof.intent} target="_blank" rel="noreferrer" className="flex min-h-12 items-center justify-center bg-fg px-5 text-bg">
                   Open X
                 </a>
