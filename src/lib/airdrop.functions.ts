@@ -1,0 +1,182 @@
+import { createServerFn } from "@tanstack/react-start";
+import { getSql } from "@/lib/db";
+import { authMiddleware } from "@/lib/auth/middleware";
+import { nextResetIso, weekKey, weekStartMs } from "@/lib/week";
+
+const GRANT = 50;
+const POST = 100;
+const POST_CAP = 3;
+const TAGS = ["#t3x", "#t3xdrop"];
+
+type BoardRow = { handle: string; coins: number };
+type DropRow = { tweetId: string; coins: number; claimed: boolean };
+
+async function xAccount(userId: string) {
+  const sql = await getSql();
+  const rows = await sql<{ accountId: string }>`
+    select "accountId" from "account" where "userId" = ${userId} and "providerId" = 'grok-x' limit 1
+  `;
+  return rows[0]?.accountId ?? null;
+}
+
+async function pulse(week: string) {
+  const sql = await getSql();
+  const rows = await sql<BoardRow>`
+    select w.handle as handle, sum(d.coins)::int as coins
+    from drops d
+    join wallets w on w.user_id = d.user_id
+    where d.week_key = ${week} and d.claimed and w.handle is not null
+    group by w.handle
+    order by coins desc
+    limit 24
+  `;
+  return rows;
+}
+
+export const getPulse = createServerFn({ method: "GET" }).handler(async () => {
+  const week = weekKey();
+  return { week, resetAt: nextResetIso(), board: await pulse(week) };
+});
+
+export const getMine = createServerFn({ method: "GET" })
+  .middleware([authMiddleware])
+  .handler(async ({ context }) => {
+    const sql = await getSql();
+    const week = weekKey();
+    const xId = await xAccount(context.userId);
+    await sql`insert into wallets (user_id) values (${context.userId}) on conflict (user_id) do nothing`;
+    if (xId) {
+      const grantId = `grant:${week}:${context.userId}`;
+      await sql`
+        insert into drops (user_id, week_key, tweet_id, coins, claimed)
+        values (${context.userId}, ${week}, ${grantId}, ${GRANT}, false)
+        on conflict (tweet_id) do nothing
+      `;
+    }
+    const wallet = await sql<{ handle: string | null; xId: string | null; balance: number }>`
+      select handle, x_id as "xId", balance from wallets where user_id = ${context.userId}
+    `;
+    const drops = await sql<DropRow>`
+      select tweet_id as "tweetId", coins, claimed
+      from drops
+      where user_id = ${context.userId} and week_key = ${week}
+      order by id
+    `;
+    const waiting = drops.filter((row) => !row.claimed).reduce((sum, row) => sum + row.coins, 0);
+    return {
+      week,
+      resetAt: nextResetIso(),
+      needsX: !xId,
+      handle: wallet[0]?.handle ?? null,
+      balance: wallet[0]?.balance ?? 0,
+      waiting,
+      drops,
+      board: await pulse(week),
+    };
+  });
+
+export const bindHandle = createServerFn({ method: "POST" })
+  .validator((handle: string) => handle.trim().replace(/^@/, ""))
+  .middleware([authMiddleware])
+  .handler(async ({ context, data: handle }) => {
+    if (!/^[A-Za-z0-9_]{1,15}$/.test(handle)) return { ok: false as const, error: "That is not an X handle." };
+    const loginId = await xAccount(context.userId);
+    if (!loginId) return { ok: false as const, error: "Sign in with X first." };
+    const profile = await loadUser(handle);
+    if (!profile) return { ok: false as const, error: "X did not show that account." };
+    if (/^\d+$/.test(loginId) && loginId !== profile.id) {
+      return { ok: false as const, error: "That handle is not the X account you signed in with." };
+    }
+    const sql = await getSql();
+    await sql`insert into wallets (user_id) values (${context.userId}) on conflict (user_id) do nothing`;
+    const taken = await sql<{ user_id: string }>`
+      select user_id from wallets where lower(handle) = lower(${handle}) and user_id <> ${context.userId} limit 1
+    `;
+    if (taken.length) return { ok: false as const, error: "That handle is already on the board." };
+    await sql`
+      update wallets set handle = ${profile.screen}, x_id = ${profile.id}
+      where user_id = ${context.userId}
+    `;
+    return { ok: true as const, handle: profile.screen };
+  });
+
+export const checkPost = createServerFn({ method: "POST" })
+  .validator((url: string) => url.trim())
+  .middleware([authMiddleware])
+  .handler(async ({ context, data: url }) => {
+    const id = url.match(/status(?:es)?\/(\d+)/)?.[1];
+    if (!id) return { ok: false as const, error: "Paste the link to the post." };
+    const sql = await getSql();
+    const week = weekKey();
+    const wallet = await sql<{ handle: string | null; xId: string | null }>`
+      select handle, x_id as "xId" from wallets where user_id = ${context.userId}
+    `;
+    const mine = wallet[0];
+    if (!mine?.handle || !mine.xId) return { ok: false as const, error: "Add your X handle first." };
+    const counted = await sql<{ n: number }>`
+      select count(*)::int as n from drops
+      where user_id = ${context.userId} and week_key = ${week} and tweet_id not like 'grant:%'
+    `;
+    if ((counted[0]?.n ?? 0) >= POST_CAP) return { ok: false as const, error: "Three posts already count this week." };
+    const tweet = await loadTweet(id);
+    if (!tweet) return { ok: false as const, error: "X did not return that post." };
+    if (tweet.authorId !== mine.xId) return { ok: false as const, error: "That post is not from your X account." };
+    const text = tweet.text.toLowerCase();
+    if (!TAGS.every((tag) => text.includes(tag))) {
+      return { ok: false as const, error: "The post needs both #T3X and #T3XDrop." };
+    }
+    const reset = Date.parse(nextResetIso());
+    if (tweet.at < weekStartMs(week) || tweet.at >= reset) {
+      return { ok: false as const, error: "That post is outside this week." };
+    }
+    const inserted = await sql<{ id: number }>`
+      insert into drops (user_id, week_key, tweet_id, coins, claimed)
+      values (${context.userId}, ${week}, ${id}, ${POST}, false)
+      on conflict (tweet_id) do nothing
+      returning id
+    `;
+    if (!inserted.length) return { ok: false as const, error: "That post is already on the board." };
+    return { ok: true as const, coins: POST };
+  });
+
+export const claimCoins = createServerFn({ method: "POST" })
+  .middleware([authMiddleware])
+  .handler(async ({ context }) => {
+    const sql = await getSql();
+    const week = weekKey();
+    const rows = await sql<{ coins: number }>`
+      update drops set claimed = true
+      where user_id = ${context.userId} and week_key = ${week} and claimed = false
+      returning coins
+    `;
+    const gained = rows.reduce((sum, row) => sum + row.coins, 0);
+    if (gained > 0) {
+      await sql`update wallets set balance = balance + ${gained} where user_id = ${context.userId}`;
+    }
+    const balance = await sql<{ balance: number }>`select balance from wallets where user_id = ${context.userId}`;
+    return { gained, balance: balance[0]?.balance ?? 0 };
+  });
+
+async function loadUser(handle: string): Promise<{ id: string; screen: string } | null> {
+  const body = await readJson(`https://api.fxtwitter.com/${encodeURIComponent(handle)}`);
+  const user = body?.user as { id?: string; screen_name?: string } | undefined;
+  if (!user?.id || !user.screen_name) return null;
+  return { id: String(user.id), screen: user.screen_name };
+}
+
+async function loadTweet(id: string): Promise<{ authorId: string; text: string; at: number } | null> {
+  const body = await readJson(`https://api.fxtwitter.com/status/${id}`);
+  const tweet = body?.tweet as {
+    text?: string;
+    created_timestamp?: number;
+    author?: { id?: string };
+  } | undefined;
+  if (!tweet?.author?.id || !tweet.text || !tweet.created_timestamp) return null;
+  return { authorId: String(tweet.author.id), text: tweet.text, at: tweet.created_timestamp * 1000 };
+}
+
+async function readJson(url: string): Promise<Record<string, unknown> | null> {
+  const response = await fetch(url, { headers: { accept: "application/json", "user-agent": "T3XAirdrop" } });
+  if (!response.ok) return null;
+  return (await response.json()) as Record<string, unknown>;
+}
