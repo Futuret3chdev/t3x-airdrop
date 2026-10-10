@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import { SignedIn, UserButton } from "@/lib/auth/gates";
 import { useCurrentUserState } from "@/lib/auth/use-current-user";
-import { bindHandle, checkPost, claimCoins, finishProof, getMine, getPulse, startProof } from "@/lib/airdrop.functions";
+import { assignWallet, bindHandle, checkPost, claimCoins, finishProof, getMine, getPulse, startProof } from "@/lib/airdrop.functions";
 
 type Row = { handle: string; coins: number };
 type Drop = { tweetId: string; coins: number; claimed: boolean };
@@ -10,6 +10,7 @@ type Pulse = { week: string; resetAt: string; board: Row[] };
 type Mine = Pulse & {
   needsX: boolean;
   handle: string | null;
+  address: string | null;
   balance: number;
   waiting: number;
   drops: Drop[];
@@ -20,6 +21,7 @@ export function Board() {
   const [pulse, setPulse] = useState<Pulse | null>(null);
   const [mine, setMine] = useState<Mine | null>(null);
   const [handle, setHandle] = useState("");
+  const [address, setAddress] = useState("");
   const [link, setLink] = useState("");
   const [note, setNote] = useState("");
   const [proof, setProof] = useState<{ handle: string; text: string; intent: string } | null>(null);
@@ -43,6 +45,7 @@ export function Board() {
       .then((next) => {
         setMine(next);
         setPulse(next);
+        if (next.address) setAddress(next.address);
       })
       .catch(() => setNote("Sign in with X to open your coins."));
   }, [user, isPending]);
@@ -114,12 +117,30 @@ export function Board() {
     }
   }
 
+  async function saveWallet() {
+    setBusy(true);
+    setNote("");
+    try {
+      const result = await assignWallet({ data: address });
+      if (!result.ok) setNote(result.error);
+      else {
+        setAddress(result.address);
+        setNote("Wallet assigned.");
+        setMine(await getMine());
+      }
+    } catch {
+      setNote("Sign in with X first.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function claim() {
     setBusy(true);
     setNote("");
     try {
       const result = await claimCoins();
-      setNote(result.gained ? `${result.gained} T3X claimed.` : "Nothing waiting this week.");
+      setNote(result.error ? result.error : result.gained ? `${result.gained} T3X claimed.` : "Nothing waiting this week.");
       setMine(await getMine());
     } catch {
       setNote("Sign in with X first.");
@@ -154,7 +175,7 @@ export function Board() {
           <li className="border border-line px-3 py-3">100 for a tagged post</li>
           <li className="border border-line px-3 py-3">Three posts, then it clears</li>
         </ul>
-        <p className="text-sm text-muted">Post with #T3X and #T3XDrop. We read the post on X. You claim the coins yourself.</p>
+        <p className="text-sm text-muted">Post with #T3X and #T3XDrop, then assign the wallet the coins should land in.</p>
 
         {(!user || mine?.needsX) && (
           <div className="grid gap-3">
@@ -200,8 +221,19 @@ export function Board() {
                 <p className="text-sm text-muted">In your wallet</p>
                 <p className="font-mono text-5xl text-gold">{mine.balance}</p>
               </div>
-              <button type="button" disabled={busy || !mine.waiting} onClick={claim} className="min-h-12 bg-fg px-5 text-bg disabled:opacity-40">
+              <button type="button" disabled={busy || !mine.waiting || !mine.address} onClick={claim} className="min-h-12 bg-fg px-5 text-bg disabled:opacity-40">
                 Claim {mine.waiting || ""}
+              </button>
+            </div>
+            <div className="flex flex-col gap-3 sm:flex-row">
+              <input
+                value={address}
+                onChange={(event) => setAddress(event.target.value)}
+                placeholder="Wallet address"
+                className="min-h-12 flex-1 border border-line bg-bg px-3 font-mono text-sm text-fg outline-none"
+              />
+              <button type="button" disabled={busy} onClick={saveWallet} className="min-h-12 border border-line px-4 text-fg">
+                {mine.address ? "Update wallet" : "Assign wallet"}
               </button>
             </div>
             {!mine.handle ? (

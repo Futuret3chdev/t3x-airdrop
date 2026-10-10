@@ -47,8 +47,8 @@ export const getMine = createServerFn({ method: "GET" })
     const week = weekKey();
     const xId = await xAccount(context.userId);
     await sql`insert into wallets (user_id) values (${context.userId}) on conflict (user_id) do nothing`;
-    const wallet = await sql<{ handle: string | null; xId: string | null; balance: number }>`
-      select handle, x_id as "xId", balance from wallets where user_id = ${context.userId}
+    const wallet = await sql<{ handle: string | null; xId: string | null; balance: number; address: string | null }>`
+      select handle, x_id as "xId", balance, address from wallets where user_id = ${context.userId}
     `;
     const known = Boolean(xId || wallet[0]?.xId);
     if (known) {
@@ -71,6 +71,7 @@ export const getMine = createServerFn({ method: "GET" })
       resetAt: nextResetIso(),
       needsX: !known,
       handle: wallet[0]?.handle ?? null,
+      address: wallet[0]?.address ?? null,
       balance: wallet[0]?.balance ?? 0,
       waiting,
       drops,
@@ -169,6 +170,22 @@ async function openSession(handle: string): Promise<{ ok: true; userId: string }
   return { ok: true, userId };
 }
 
+export const assignWallet = createServerFn({ method: "POST" })
+  .validator((address: string) => address.trim())
+  .middleware([authMiddleware])
+  .handler(async ({ context, data: raw }) => {
+    const address = cleanAddress(raw);
+    if (!address) return { ok: false as const, error: "Paste a wallet address." };
+    const sql = await getSql();
+    const taken = await sql<{ user_id: string }>`
+      select user_id from wallets where lower(address) = lower(${address}) and user_id <> ${context.userId} limit 1
+    `;
+    if (taken.length) return { ok: false as const, error: "That wallet is already assigned." };
+    await sql`insert into wallets (user_id) values (${context.userId}) on conflict (user_id) do nothing`;
+    await sql`update wallets set address = ${address} where user_id = ${context.userId}`;
+    return { ok: true as const, address };
+  });
+
 export const bindHandle = createServerFn({ method: "POST" })
   .validator((handle: string) => handle.trim().replace(/^@/, ""))
   .middleware([authMiddleware])
@@ -238,6 +255,10 @@ export const claimCoins = createServerFn({ method: "POST" })
   .handler(async ({ context }) => {
     const sql = await getSql();
     const week = weekKey();
+    const wallet = await sql<{ address: string | null; balance: number }>`
+      select address, balance from wallets where user_id = ${context.userId}
+    `;
+    if (!wallet[0]?.address) return { gained: 0, balance: wallet[0]?.balance ?? 0, error: "Assign a wallet first." };
     const rows = await sql<{ coins: number }>`
       update drops set claimed = true
       where user_id = ${context.userId} and week_key = ${week} and claimed = false
@@ -248,8 +269,15 @@ export const claimCoins = createServerFn({ method: "POST" })
       await sql`update wallets set balance = balance + ${gained} where user_id = ${context.userId}`;
     }
     const balance = await sql<{ balance: number }>`select balance from wallets where user_id = ${context.userId}`;
-    return { gained, balance: balance[0]?.balance ?? 0 };
+    return { gained, balance: balance[0]?.balance ?? 0, error: "" };
   });
+
+function cleanAddress(raw: string) {
+  const address = raw.trim();
+  if (/^0x[a-fA-F0-9]{40}$/.test(address)) return address;
+  if (/^[1-9A-HJ-NP-Za-km-z]{32,64}$/.test(address)) return address;
+  return null;
+}
 
 async function loadUser(handle: string): Promise<{ id: string; screen: string } | null> {
   const body = await readJson(`https://api.fxtwitter.com/${encodeURIComponent(handle)}`);
